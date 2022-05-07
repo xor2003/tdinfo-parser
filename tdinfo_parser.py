@@ -24,166 +24,159 @@ class TdinfoParserUnsupportedSymbolClassException(TdinfoParserException):
     pass
 
 
-def _parse_exe_file():
-    input_file_path = ida_kernwin.ask_file(False, ida_nalt.get_input_file_path(), 'Input file')
-    parsed_file = tdinfo_structs.DOS_MZ_EXE_STRUCT.parse_file(input_file_path)
+class TdinfoParser(object):
+    def __init__(self):
+        # A heuristic, since get_imagebase returns wrong result
+        self._image_base = ida_segment.get_first_seg().start_ea
+        self._parsed_exe = self._parse_exe_file()
 
-    print('Borland TLink symbolic information version: {}.{}'.format(
-        parsed_file.tdinfo_header.major_version,
-        parsed_file.tdinfo_header.minor_version))
+    @staticmethod
+    def _parse_exe_file():
+        input_file_path = ida_kernwin.ask_file(False, ida_nalt.get_input_file_path(), 'Input file')
+        parsed_exe = tdinfo_structs.DOS_MZ_EXE_STRUCT.parse_file(input_file_path)
 
-    return parsed_file
+        print('Borland TLink symbolic information version: {}.{}'.format(
+            parsed_exe.tdinfo_header.major_version,
+            parsed_exe.tdinfo_header.minor_version))
 
+        return parsed_exe
 
-def _apply_tdinfo_symbol(image_base, name_pool, symbol):
-    if symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.STATIC.name:
-        raise TdinfoParserUnsupportedSymbolClassException()
+    def apply_tdinfo(self):
+        applied_symbols_count = 0
+        already_existing_symbols_count = 0
+        for symbol in self._parsed_exe.symbol_records:
+            try:
+                self._apply_tdinfo_symbol(symbol)
+                self._apply_tdinfo_type(symbol)
+                applied_symbols_count += 1
+            except TdinfoParserSymbolAlreadyAppliedException:
+                already_existing_symbols_count += 1
+            except TdinfoParserException:
+                pass
 
-    symbol_ea = image_base + symbol.segment * 0x10 + symbol.offset
-    symbol_name = str(name_pool[symbol.index - 1])
+        for segment in self._parsed_exe.segment_records:
+            self._apply_tdinfo_segment(segment)
+            self._apply_tdinfo_scopes(segment)
 
-    if ida_name.get_name(symbol_ea) == symbol_name:
-        raise TdinfoParserSymbolAlreadyAppliedException()
+        print('Detected {} global symbols.'.format(
+            self._parsed_exe.tdinfo_header.globals_count)),
+        print('{} identical symbols already existed, {} new symbols were applied.'.format(
+            already_existing_symbols_count,
+            applied_symbols_count))
 
-    if ida_name.set_name(symbol_ea, symbol_name):
-        print('Applied name {} to address {:04X}:{:04X}'.format(
-            symbol_name,
-            image_base // 0x10 + symbol.segment,
-            symbol.offset))
-    else:
-        raise TdinfoParserIdaSetNameFailedException()
+    def _apply_tdinfo_symbol(self, symbol):
+        if symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.STATIC.name:
+            raise TdinfoParserUnsupportedSymbolClassException()
 
+        symbol_ea = self._image_base + symbol.segment * 0x10 + symbol.offset
+        symbol_name = str(self._parsed_exe.name_pool[symbol.index - 1])
 
-def apply_tdinfo_symbols():
-    # A heuristic, since get_imagebase returns wrong result
-    image_base = ida_segment.get_first_seg().start_ea
+        if ida_name.get_name(symbol_ea) == symbol_name:
+            raise TdinfoParserSymbolAlreadyAppliedException()
 
-    parsed_exe_file = _parse_exe_file()
-
-    applied_symbols_count = 0
-    already_existing_symbols_count = 0
-    for symbol in parsed_exe_file.symbol_records:
-        try:
-            _apply_tdinfo_symbol(image_base, parsed_exe_file.name_pool, symbol)
-            _apply_tdinfo_type(image_base, parsed_exe_file, symbol)
-            applied_symbols_count += 1
-        except TdinfoParserSymbolAlreadyAppliedException:
-            already_existing_symbols_count += 1
-        except TdinfoParserException:
-            pass
-
-    print('Detected {} global symbols.'.format(
-        parsed_exe_file.tdinfo_header.globals_count)),
-    print('{} identical symbols already existed, {} new symbols were applied.'.format(
-        already_existing_symbols_count,
-        applied_symbols_count))
-
-    for segment in parsed_exe_file.segment_records:
-        _apply_tdinfo_segment(image_base, parsed_exe_file, segment)
-        _apply_tdinfo_scopes(image_base, parsed_exe_file, segment)
-
-
-def _apply_tdinfo_type(image_base, parsed_exe_file, symbol):
-    if (symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.STATIC.name or
-        symbol.type == 0):
-        return
-
-    symbol_ea = image_base + symbol.segment * 0x10 + symbol.offset
-    symbol_name = str(parsed_exe_file.name_pool[symbol.index - 1])
-
-    type = parsed_exe_file.type_records[symbol.type - 1]
-    _apply_tdinfo_type_rec(symbol_ea, symbol_name, parsed_exe_file, type)
-
-
-def _apply_tdinfo_type_rec(symbol_ea, symbol_name, parsed_exe_file, type):
-    if (type.id == tdinfo_structs.TypeId.SCHAR.name or
-        type.id == tdinfo_structs.TypeId.UCHAR.name):
-        idc.create_byte(symbol_ea)
-    elif (type.id == tdinfo_structs.TypeId.SINT.name or
-          type.id == tdinfo_structs.TypeId.UINT.name):
-        idc.create_word(symbol_ea)
-    elif (type.id == tdinfo_structs.TypeId.SLONG.name or
-          type.id == tdinfo_structs.TypeId.ULONG.name or
-          type.id == tdinfo_structs.TypeId.FAR.name):
-        idc.create_dword(symbol_ea)
-    elif type.id == tdinfo_structs.TypeId.ARRAY.name:
-        member = parsed_exe_file.type_records[type.member_type - 1]
-        if member.id == tdinfo_structs.TypeId.ARRAY.name: # array of arrays
-            idc.make_array(symbol_ea, type.size)
+        if ida_name.set_name(symbol_ea, symbol_name):
+            print('Applied name {} to address {:04X}:{:04X}'.format(
+                symbol_name,
+                self._image_base // 0x10 + symbol.segment,
+                symbol.offset))
         else:
-            _apply_tdinfo_type_rec(symbol_ea, symbol_name, parsed_exe_file, member)
-            idc.make_array(symbol_ea, type.size // member.size)
-    elif type.id == tdinfo_structs.TypeId.STRUCT.name:
-        struct_name = 'struct' + symbol_name
-        if get_struc_id(struct_name) == BADADDR: #check if struct already exists
-            _apply_tdinfo_struct(struct_name, parsed_exe_file, type)
-        idc.create_struct(symbol_ea, -1, struct_name)
+            raise TdinfoParserIdaSetNameFailedException()
 
+    def _apply_tdinfo_type(self, symbol):
+        if (symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.STATIC.name or
+            symbol.type == 0):
+            return
 
-def _apply_tdinfo_struct(struct_name, parsed_exe_file, type): #create struct + members
-    id = idc.add_struc(-1, struct_name, 0)
+        symbol_ea = self._image_base + symbol.segment * 0x10 + symbol.offset
+        symbol_name = str(self._parsed_exe.name_pool[symbol.index - 1])
 
-    memberIndex = type.member_type - 1
-    member = parsed_exe_file.member_records[memberIndex]
-    while True: # loop on struct members
-        member_name = str(parsed_exe_file.name_pool[member.name - 1])
-        member_type = parsed_exe_file.type_records[member.type - 1]
+        type = self._parsed_exe.type_records[symbol.type - 1]
+        self._apply_tdinfo_type_rec(symbol_ea, symbol_name, type)
 
-        if (member_type.id == tdinfo_structs.TypeId.SINT.name or
-            member_type.id == tdinfo_structs.TypeId.UINT.name):
-            flag = FF_WORD
-        elif (member_type.id == tdinfo_structs.TypeId.SLONG.name or
-              member_type.id == tdinfo_structs.TypeId.ULONG.name or
-              member_type.id == tdinfo_structs.TypeId.FAR.name):
-            flag = FF_DWORD
-        else:
-            flag = FF_BYTE
+    def _apply_tdinfo_type_rec(self, symbol_ea, symbol_name, type):
+        if (type.id == tdinfo_structs.TypeId.SCHAR.name or
+            type.id == tdinfo_structs.TypeId.UCHAR.name):
+            idc.create_byte(symbol_ea)
+        elif (type.id == tdinfo_structs.TypeId.SINT.name or
+            type.id == tdinfo_structs.TypeId.UINT.name):
+            idc.create_word(symbol_ea)
+        elif (type.id == tdinfo_structs.TypeId.SLONG.name or
+            type.id == tdinfo_structs.TypeId.ULONG.name or
+            type.id == tdinfo_structs.TypeId.FAR.name):
+            idc.create_dword(symbol_ea)
+        elif type.id == tdinfo_structs.TypeId.ARRAY.name:
+            member = self._parsed_exe.type_records[type.member_type - 1]
+            if member.id == tdinfo_structs.TypeId.ARRAY.name: # array of arrays
+                idc.make_array(symbol_ea, type.size)
+            else:
+                self._apply_tdinfo_type_rec(symbol_ea, symbol_name, member)
+                idc.make_array(symbol_ea, type.size // member.size)
+        elif type.id == tdinfo_structs.TypeId.STRUCT.name:
+            struct_name = 'struct' + symbol_name
+            if get_struc_id(struct_name) == BADADDR: #check if struct already exists
+                self._apply_tdinfo_struct(struct_name, type)
+            idc.create_struct(symbol_ea, -1, struct_name)
 
-        idc.add_struc_member(id, member_name, -1, flag, -1, member_type.size)
+    def _apply_tdinfo_struct(self, struct_name, type): #create struct + members
+        id = idc.add_struc(-1, struct_name, 0)
 
-        memberIndex += 1
-        member = parsed_exe_file.member_records[memberIndex]
-        if member.info == 0xC0: #end marker
-            break
+        memberIndex = type.member_type - 1
+        member = self._parsed_exe.member_records[memberIndex]
+        while True: # loop on struct members
+            member_name = str(self._parsed_exe.name_pool[member.name - 1])
+            member_type = self._parsed_exe.type_records[member.type - 1]
 
+            if (member_type.id == tdinfo_structs.TypeId.SINT.name or
+                member_type.id == tdinfo_structs.TypeId.UINT.name):
+                flag = FF_WORD
+            elif (member_type.id == tdinfo_structs.TypeId.SLONG.name or
+                member_type.id == tdinfo_structs.TypeId.ULONG.name or
+                member_type.id == tdinfo_structs.TypeId.FAR.name):
+                flag = FF_DWORD
+            else:
+                flag = FF_BYTE
 
-def _apply_tdinfo_segment(image_base, parsed_exe_file, segment):
-    segment_ea = image_base + segment.code_segment * 0x10 + segment.code_offset
-    module = parsed_exe_file.module_records[segment.module - 1]
-    module_name = str(parsed_exe_file.name_pool[module.name - 1])
+            idc.add_struc_member(id, member_name, -1, flag, -1, member_type.size)
 
-    if set_segm_name(segment_ea, module_name):
-        print('Applied name {} to segment {:04X}:{:04X}'.format(
-            module_name,
-            image_base // 0x10 + segment.code_segment, segment.code_offset))
+            memberIndex += 1
+            member = self._parsed_exe.member_records[memberIndex]
+            if member.info == 0xC0: #end marker
+                break
 
+    def _apply_tdinfo_segment(self, segment):
+        segment_ea = self._image_base + segment.code_segment * 0x10 + segment.code_offset
+        module = self._parsed_exe.module_records[segment.module - 1]
+        module_name = str(self._parsed_exe.name_pool[module.name - 1])
 
-def _apply_tdinfo_scopes(image_base, parsed_exe_file, segment):
-    for i in range(segment.scope_count):
-        scope = parsed_exe_file.scope_records[segment.scope_index - 1 + i]
-        _apply_tdinfo_scope(image_base, parsed_exe_file, segment, scope)
+        if set_segm_name(segment_ea, module_name):
+            print('Applied name {} to segment {:04X}:{:04X}'.format(
+                module_name,
+                self._image_base // 0x10 + segment.code_segment, segment.code_offset))
 
+    def _apply_tdinfo_scopes(self, segment):
+        for i in range(segment.scope_count):
+            scope = self._parsed_exe.scope_records[segment.scope_index - 1 + i]
+            self._apply_tdinfo_scope(segment, scope)
 
-def _apply_tdinfo_scope(image_base, parsed_exe_file, segment, scope):
-    scope_offset = scope.offset if scope.parent == 0 else parsed_exe_file.scope_records[scope.parent - 1].offset
-    scope_ea = image_base + segment.code_segment * 0x10 + scope_offset
+    def _apply_tdinfo_scope(self, segment, scope):
+        scope_offset = scope.offset if scope.parent == 0 else self._parsed_exe.scope_records[scope.parent - 1].offset
+        scope_ea = self._image_base + segment.code_segment * 0x10 + scope_offset
 
-    for i in range(scope.symbol_count):
-        symbol = parsed_exe_file.symbol_records[scope.symbol_index - 1 + i]
-        _apply_tdinfo_localvar(image_base, parsed_exe_file, symbol, segment, scope_ea, scope_offset)
+        for i in range(scope.symbol_count):
+            symbol = self._parsed_exe.symbol_records[scope.symbol_index - 1 + i]
+            self._apply_tdinfo_localvar(symbol, segment, scope_ea, scope_offset)
 
+    def _apply_tdinfo_localvar(self, symbol, segment, scope_ea, scope_offset):
+        if symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.AUTO.name:
+            return
 
-def _apply_tdinfo_localvar(image_base, parsed_exe_file, symbol, segment, scope_ea, scope_offset):
-    if symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.AUTO.name:
-        return
+        symbol_name = str(self._parsed_exe.name_pool[symbol.index - 1])
+        offset = symbol.offset - 0x10000 if symbol.offset > 0x7fff else symbol.offset
+        operator = '+' if offset >= 0 else '-'
 
-    symbol_name = str(parsed_exe_file.name_pool[symbol.index - 1])
-    offset = symbol.offset - 0x10000 if symbol.offset > 0x7fff else symbol.offset
-    operator = '+' if offset >= 0 else '-'
-
-    idc.add_func(scope_ea, BADADDR) # create function if needed
-    if (idc.define_local_var(scope_ea, scope_ea, '[bp{}{}]'.format(operator, abs(offset)), symbol_name)):
-        print('Applied name {} to [bp{}{}] at address {:04X}:{:04X}'.format(
-            symbol_name,
-            operator, abs(offset),
-            image_base // 0x10 + segment.code_segment, scope_offset))
+        idc.add_func(scope_ea, BADADDR) # create function if needed
+        if (idc.define_local_var(scope_ea, scope_ea, '[bp{}{}]'.format(operator, abs(offset)), symbol_name)):
+            print('Applied name {} to [bp{}{}] at address {:04X}:{:04X}'.format(
+                symbol_name,
+                operator, abs(offset),
+                self._image_base // 0x10 + segment.code_segment, scope_offset))
