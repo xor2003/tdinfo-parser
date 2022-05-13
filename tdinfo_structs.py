@@ -76,6 +76,7 @@ class TypeId(enum.IntEnum):
     GLOBALHANDLE = 62
     LOCALHANDLE = 63
 
+
 SYMBOL_RECORD_STRUCT = Struct(
     'index' / Int16ul,  # 1-based
     'type' / Int16ul,
@@ -137,8 +138,8 @@ TDINFO_HEADER_STRUCT = Struct(
     'modules_count' / Int16ul,
     'locals_count' / Int16ul,
     'scopes_count' / Int16ul,
-    'linenumbers_count' / Int16ul,
-    'sourcefiles_count' / Int16ul,
+    'line_numbers_count' / Int16ul,
+    'source_files_count' / Int16ul,
     'segments_count' / Int16ul,
     'correlations_count' / Int16ul,
     Padding(14),
