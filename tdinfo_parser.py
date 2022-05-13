@@ -75,3 +75,59 @@ def apply_tdinfo_symbols():
     print('{} identical symbols already existed, {} new symbols were applied.'.format(
         already_existing_symbols_count,
         applied_symbols_count))
+
+import ida_auto
+import idc
+import sys
+
+
+class TDImportPlugin(ida_idaapi.plugin_t):
+    """
+    XML Exporter plugin class
+    """
+    flags = 0
+    comment = "TD Import"
+    help = "TD Import"
+    wanted_name = "TD Import"
+    wanted_hotkey = "Ctrl-Shift-t"
+
+
+    def init(self):
+        """
+        init function for XML Exporter plugin.
+        
+        Returns:
+            Constant PLUGIN_OK if this IDA version supports the plugin,
+            else returns PLUGIN_SKIP if this IDA is older than the supported
+            baseline version.
+        """
+        return ida_idaapi.PLUGIN_OK 
+
+
+    def run(self, arg):
+        """
+        run function for XML Exporter plugin.
+        
+        Args:
+            arg: Integer, non-zero value enables auto-run feature for
+                IDA batch (no gui) processing mode. Default is 0.
+        """
+        st = idc.set_ida_state(idc.IDA_STATUS_WORK)
+        try:
+            try:
+                apply_tdinfo_symbols()
+            except:
+                ida_kernwin.hide_wait_box()
+                msg = "***** Exception occurred: XML Exporter failed! *****"
+                print "\n" + msg + "\n", sys.exc_type, sys.exc_value
+                idc.warning(msg)
+        finally:
+            ida_auto.set_ida_state(st)
+
+
+    def term(self):
+        pass
+
+
+def PLUGIN_ENTRY():
+    return TDImportPlugin()
