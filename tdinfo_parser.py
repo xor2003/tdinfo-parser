@@ -9,7 +9,6 @@ import ida_netnode
 import ida_segment
 import ida_struct
 
-import tdinfo_structs
 ida_idaapi.require('tdinfo_structs')
 
 
