@@ -1,4 +1,6 @@
 import ida_bytes
+import ida_frame
+import ida_funcs
 import ida_idaapi
 import ida_kernwin
 import ida_nalt
@@ -6,7 +8,6 @@ import ida_name
 import ida_netnode
 import ida_segment
 import ida_struct
-import idc
 
 import tdinfo_structs
 ida_idaapi.require('tdinfo_structs')
@@ -24,6 +25,10 @@ class TdinfoParserSymbolAlreadyAppliedException(TdinfoParserException):
 
 
 class TdinfoParserNullNameIndexException(TdinfoParserException):
+    pass
+
+
+class TdinfoParserTypeOfSizeZeroException(TdinfoParserException):
     pass
 
 
@@ -84,9 +89,9 @@ class TdinfoParser(object):
             except TdinfoParserUnsupportedSymbolClassException:
                 pass
 
-        for segment in self._parsed_exe.segment_records:
-            self._apply_segment(segment)
-            self._apply_scopes(segment)
+        for segment_record in self._parsed_exe.segment_records:
+            self._apply_segment_name(segment_record)
+            self._apply_scopes(segment_record)
 
         print('Detected {} global symbols.'.format(
             self._parsed_exe.tdinfo_header.globals_count)),
@@ -130,19 +135,30 @@ class TdinfoParser(object):
         else:
             raise TdinfoParserIdaSetNameFailedException()
 
+    def _get_type_record_size(self, type_record):
+        size = type_record.size
+        if size == 0:
+            # Perhaps the type is an array of size 0, so we return the inner type size instead
+            inner_type_record = self._get_array_inner_type_record(type_record)
+            size = inner_type_record.size
+
+        if size == 0:
+            raise TdinfoParserTypeOfSizeZeroException()
+
+        return size
+
     def _apply_type(self, symbol, symbol_ea):
         if not symbol.type:
             return
 
         type_record = self._parsed_exe.type_records[symbol.type - 1]
         type_flag = self._type_record_to_ida_type_flag(type_record)
+        size = self._get_type_record_size(type_record)
+        tid = ida_netnode.BADNODE
+
         if type_flag == ida_bytes.stru_flag():
-            struct_type_record = self._get_array_inner_type_record(type_record)
-            tid = self._get_struct_tid(struct_type_record)
-            size = ida_struct.get_struc_size(tid)
-        else:
-            tid = ida_netnode.BADNODE
-            size = type_record.size
+            inner_type_record = self._get_array_inner_type_record(type_record)
+            tid = self._get_struct_tid(inner_type_record)
 
         ida_bytes.del_items(symbol_ea, ida_bytes.DELIT_SIMPLE, size)
         ida_bytes.create_data(symbol_ea, type_flag, size, tid)
@@ -240,40 +256,73 @@ class TdinfoParser(object):
     def _is_global_symbol(self, symbol):
         return symbol.bitfield.symbol_class == tdinfo_structs.SymbolClass.STATIC.name
 
-    def _apply_segment(self, segment):
-        segment_ea = self._image_base + segment.code_segment * 0x10 + segment.code_offset
-        module = self._parsed_exe.module_records[segment.module - 1]
+    def _apply_segment_name(self, segment_record):
+        seg_ea = self._image_base + segment_record.code_segment * 10 + segment_record.code_offset
+        module = self._parsed_exe.module_records[segment_record.module - 1]
         module_name = self._get_name_from_pool(module.name)
 
-        if set_segm_name(segment_ea, module_name):
+        segment_ptr = ida_segment.getseg(seg_ea)
+        if ida_segment.set_segm_name(segment_ptr, module_name):
             print('Applied name {} to segment {:04X}:{:04X}'.format(
                 module_name,
-                self._image_base // 0x10 + segment.code_segment, segment.code_offset))
+                self._image_base // 0x10 + segment_record.code_segment,
+                segment_record.code_offset))
 
-    def _apply_scopes(self, segment):
-        for i in range(segment.scope_count):
-            scope = self._parsed_exe.scope_records[segment.scope_index - 1 + i]
-            self._apply_scope(segment, scope)
+    def _apply_scopes(self, segment_record):
+        first_scope_index = segment_record.scope_index - 1
+        range_end = first_scope_index + segment_record.scope_count
+        for scope_index in range(first_scope_index, range_end):
+            scope_record = self._parsed_exe.scope_records[scope_index]
+            self._apply_scope(segment_record, scope_record)
 
-    def _apply_scope(self, segment, scope):
-        scope_offset = scope.offset if scope.parent == 0 else self._parsed_exe.scope_records[scope.parent - 1].offset
-        scope_ea = self._image_base + segment.code_segment * 0x10 + scope_offset
+    def _apply_scope(self, segment_record, scope_record):
+        if scope_record.parent == 0:
+            scope_offset = scope_record.offset
+        else:
+            scope_offset = self._parsed_exe.scope_records[scope_record.parent - 1].offset
+        scope_ea = self._image_base + segment_record.code_segment * 0x10 + scope_offset
 
-        for i in range(scope.symbol_count):
-            symbol = self._parsed_exe.symbol_records[scope.symbol_index - 1 + i]
-            self._apply_local_variable(symbol, segment, scope_ea, scope_offset)
+        first_symbol_index = scope_record.symbol_index - 1
+        range_end = first_symbol_index + scope_record.symbol_count
+        for symbol_index in range(first_symbol_index, range_end):
+            symbol = self._parsed_exe.symbol_records[symbol_index]
+            self._apply_local_variable(symbol, scope_ea)
 
-    def _apply_local_variable(self, symbol, segment, scope_ea, scope_offset):
+    def _struct_type_record_to_tid_and_size(self, type_record):
+        inner_type_record = self._get_array_inner_type_record(type_record)
+        assert inner_type_record.id == tdinfo_structs.TypeId.STRUCT.name
+
+        tid = self._get_struct_tid(inner_type_record)
+        # IDAPython is used because the size inside of a struct type record may be 0
+        size = ida_struct.get_struc_size(tid)
+
+        return tid, size
+
+    def _apply_local_variable(self, symbol, scope_ea):
         if symbol.bitfield.symbol_class != tdinfo_structs.SymbolClass.AUTO.name:
             return
 
+        type_record = self._parsed_exe.type_records[symbol.type - 1]
+        type_flag = self._type_record_to_ida_type_flag(type_record)
+
+        inner_type_record = self._get_array_inner_type_record(type_record)
+        # Defining array stack variables is not supported in IDAPython(?)
+        size = inner_type_record.size
+        tid = None
+
+        if type_flag == ida_bytes.stru_flag():
+            tid = self._get_struct_tid(inner_type_record)
+
         symbol_name = self._get_name_from_pool(symbol.index)
         offset = symbol.offset - 0x10000 if symbol.offset > 0x7fff else symbol.offset
-        operator = '+' if offset >= 0 else '-'
 
-        idc.add_func(scope_ea, BADADDR) # create function if needed
-        if (idc.define_local_var(scope_ea, scope_ea, '[bp{}{}]'.format(operator, abs(offset)), symbol_name)):
-            print('Applied name {} to [bp{}{}] at address {:04X}:{:04X}'.format(
+        ida_funcs.add_func(scope_ea)  # Create function if missing
+        func_ptr = ida_funcs.get_func(scope_ea)
+
+        if ida_frame.define_stkvar(func_ptr, symbol_name, offset, type_flag, tid, size):
+            variable_location_string = '[bp{}{:02X}]'.format(
+                '+' if offset >= 0 else '-', abs(offset))
+            print('Applied name {} to {} in function {}'.format(
                 symbol_name,
-                operator, abs(offset),
-                self._image_base // 0x10 + segment.code_segment, scope_offset))
+                variable_location_string,
+                ida_funcs.get_func_name(scope_ea)))
